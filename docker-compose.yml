@@ -1,0 +1,103 @@
+name: dbfarm
+
+# One Postgres instance holding many databases, plus two web UIs that talk to it
+# over the internal `dbfarm` network. Nothing here is published beyond
+# ${BIND_ADDR} (127.0.0.1 by default) — see README "Exposing the UIs".
+
+services:
+  postgres:
+    image: postgres:${PG_VERSION:-18}
+    container_name: dbfarm-postgres
+    restart: unless-stopped
+    shm_size: ${PG_SHM_SIZE:-256mb}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env — run ./setup.sh}
+      POSTGRES_DB: postgres
+      # Pinned explicitly: the postgres:18 image moved its default data dir to
+      # /var/lib/postgresql/<major>/docker. Naming it ourselves keeps the same
+      # bind mount working across major versions.
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_INITDB_ARGS: --data-checksums
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      # consumed by init/10-farm-bootstrap.sh on first boot only
+      PGBACKWEB_DB_PASSWORD: ${PGBACKWEB_DB_PASSWORD:?set PGBACKWEB_DB_PASSWORD in .env — run ./setup.sh}
+      TZ: ${TZ:-UTC}
+    command:
+      - postgres
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-200}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1536MB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION:-1000}
+    volumes:
+      - ./volumes/postgres:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5440}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [dbfarm]
+
+  pg-view:
+    image: lcurrol/pg-view:${PGVIEW_VERSION:-latest}
+    container_name: dbfarm-pgview
+    restart: unless-stopped
+    environment:
+      PGVIEW_USERNAME: ${PGVIEW_USERNAME:-admin}
+      PGVIEW_PASSWORD: ${PGVIEW_PASSWORD:?set PGVIEW_PASSWORD in .env — run ./setup.sh}
+      PGVIEW_SESSION_SECRET: ${PGVIEW_SESSION_SECRET:?set PGVIEW_SESSION_SECRET in .env — run ./setup.sh}
+      PGVIEW_READ_ONLY: ${PGVIEW_READ_ONLY:-false}
+      # Seed connection: the maintenance database as superuser. Every other
+      # database is added from the UI — see `./dbctl.sh dsn <db> <user>`.
+      DB_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable
+      TZ: ${TZ:-UTC}
+    volumes:
+      # saved connections + SQL history
+      - ./volumes/pg-view:/app/.data
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PGVIEW_PORT:-8040}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [dbfarm]
+
+  pgbackweb:
+    image: eduardolat/pgbackweb:${PGBACKWEB_VERSION:-0.5.1}
+    container_name: dbfarm-pgbackweb
+    restart: unless-stopped
+    environment:
+      PBW_ENCRYPTION_KEY: ${PGBACKWEB_ENCRYPTION_KEY:?set PGBACKWEB_ENCRYPTION_KEY in .env — run ./setup.sh}
+      # Its own metadata lives in a `pgbackweb` database on the same instance.
+      # See README "The one circular dependency".
+      PBW_POSTGRES_CONN_STRING: postgresql://pgbackweb:${PGBACKWEB_DB_PASSWORD}@postgres:5432/pgbackweb?sslmode=disable
+      PBW_LISTEN_HOST: 0.0.0.0
+      PBW_LISTEN_PORT: "8085"
+      # Backup cron schedules are interpreted in this timezone.
+      TZ: ${TZ:-UTC}
+    volumes:
+      # local destination target; S3/R2 destinations do not touch this
+      - ./backups:/backups
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PGBACKWEB_PORT:-8045}:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [dbfarm]
+
+networks:
+  dbfarm:
+    name: dbfarm
