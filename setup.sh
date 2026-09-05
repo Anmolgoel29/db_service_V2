@@ -43,6 +43,16 @@ else
   set_val PGBACKWEB_ENCRYPTION_KEY   "$(gen 32)"
   set_val PGVIEW_PASSWORD            "$(gen 16)"
   set_val PGVIEW_SESSION_SECRET      "$(gen 32)"
+
+  # BIND_ADDR=0.0.0.0 in .env.example publishes on this box's public IP; fill
+  # PUBLIC_HOST with it so the generated DSNs point somewhere reachable.
+  public_ip="$(curl -s -4 --max-time 5 ifconfig.me || true)"
+  if [[ $public_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    set_val PUBLIC_HOST "$public_ip"
+    info "detected public IP $public_ip — set as PUBLIC_HOST"
+  else
+    warn "couldn't auto-detect a public IP — set PUBLIC_HOST in .env by hand"
+  fi
 fi
 
 info "creating data directories"

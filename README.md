@@ -18,7 +18,6 @@ plain database with a UI and backups.
 
 ```
 docker-compose.yml          the three services
-docker-compose.tunnel.yml   optional: expose the UIs via Cloudflare Tunnel
 .env.example                every knob; ./setup.sh turns it into .env
 setup.sh                    generates secrets, creates the bind-mount dirs
 dbctl.sh                    the entry point — databases, users, dumps, stack
@@ -183,14 +182,12 @@ second small Postgres container — one extra container, no shared fate.
 
 ## Exposing the UIs
 
-`docker-compose.tunnel.yml` adds `cloudflared` so the UIs are reachable without
-opening a port. Set `CLOUDFLARE_TUNNEL_TOKEN` and
-`COMPOSE_FILE=docker-compose.yml:docker-compose.tunnel.yml` in `.env`, then map
-hostnames to `pg-view:3000` and `pgbackweb:8085` in the Cloudflare dashboard.
-Keep hostnames one label deep (`x-db.solveease.in`, not `x.db.solveease.in`) —
-the Universal SSL wildcard constraint documented in V1 applies here too. Put a
-Cloudflare Access policy in front; both UIs have logins, but a database console
-on the open internet deserves a second door.
+`BIND_ADDR=0.0.0.0` publishes Postgres, pg-view, and PG Back Web directly on
+the server's public IP (`PUBLIC_HOST`) with no proxy or tunnel in front. All
+three still require their own login/password, but there is nothing else
+between them and the internet — treat the passwords in `.env` and
+`credentials/` accordingly, and consider a host firewall restricting the ports
+to known source IPs if that becomes an option later.
 
 ## Operations
 
