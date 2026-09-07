@@ -68,6 +68,11 @@ case "$mode" in
     info "streaming DATA ONLY for '$tenant': V1 -> V2 (schema must already exist there — e.g. from your migrations)"
     ;;
   "")
+    # --clean --if-exists: every fresh Postgres database already has a
+    # `public` schema (dbctl.sh new just created one), so the incoming
+    # `CREATE SCHEMA public;` collides unless we drop-and-recreate it first.
+    # Also makes a re-run of this script safe/idempotent.
+    dump_flags+=(--clean --if-exists)
     info "streaming schema + data for '$tenant': V1 -> V2"
     ;;
   *)
@@ -83,6 +88,22 @@ fi
     pg_dump -U postgres -p "$pg_port" -d postgres "${dump_flags[@]}" ) \
   | compose_v2 exec -T -e PGPASSWORD="$POSTGRES_PASSWORD" postgres \
       psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d "$tenant"
+
+if [[ $mode == "" ]]; then
+  # The load above connected (and therefore created every object) as the
+  # `postgres` superuser, since --no-owner strips the original OWNER TO
+  # statements. Left alone, `postgres` would own goelneha's tables instead of
+  # goelneha's own role — reassign ownership and reapply dbctl.sh new's
+  # schema-level lockdown (CREATE on public revoked from PUBLIC) that
+  # dropping/recreating the schema just reset to Postgres's defaults.
+  info "reassigning ownership in '$tenant' from postgres to $tenant"
+  compose_v2 exec -T -e PGPASSWORD="$POSTGRES_PASSWORD" postgres \
+    psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d "$tenant" <<SQL
+REASSIGN OWNED BY postgres TO "$tenant";
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT ALL ON SCHEMA public TO "$tenant";
+SQL
+fi
 
 info "done: $tenant"
 
