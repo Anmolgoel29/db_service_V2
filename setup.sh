@@ -44,15 +44,26 @@ else
   set_val PGVIEW_PASSWORD            "$(gen 16)"
   set_val PGVIEW_SESSION_SECRET      "$(gen 32)"
 
-  # BIND_ADDR=0.0.0.0 in .env.example publishes on this box's public IP; fill
-  # PUBLIC_HOST with it so the generated DSNs point somewhere reachable.
-  public_ip="$(curl -s -4 --max-time 5 ifconfig.me || true)"
-  if [[ $public_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-    set_val PUBLIC_HOST "$public_ip"
-    info "detected public IP $public_ip — set as PUBLIC_HOST"
+  # PUBLIC_HOST goes into the DSNs in credentials/, so it must be an address
+  # that is actually ON this machine. An address discovered via an outside
+  # service (ifconfig.me and friends) is the NAT gateway's, not this box's, and
+  # would produce DSNs nothing can dial. Prefer, in order: Tailscale, then the
+  # source address of the default route.
+  detect_host() {
+    local ip
+    ip="$(ip -4 -brief addr show tailscale0 2>/dev/null | awk '{print $3}' | cut -d/ -f1)"
+    [[ -n $ip ]] && { printf '%s' "$ip"; return; }
+    ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1); exit}'
+  }
+  host_ip="$(detect_host || true)"
+  if [[ $host_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    set_val PUBLIC_HOST "$host_ip"
+    info "PUBLIC_HOST set to $host_ip (this machine's own address)"
   else
-    warn "couldn't auto-detect a public IP — set PUBLIC_HOST in .env by hand"
+    warn "couldn't detect a local address — set PUBLIC_HOST in .env by hand"
   fi
+  warn "if this machine sits behind NAT, reaching it from the internet needs a
+      port forward on the router — PUBLIC_HOST is not that address."
 fi
 
 info "creating data directories"
