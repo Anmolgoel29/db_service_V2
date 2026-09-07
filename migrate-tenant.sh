@@ -55,10 +55,16 @@ set -a; . "$ROOT/.env"; set +a
 dump_flags=(--schema=public --no-owner --no-privileges)
 case "$mode" in
   --data-only)
-    # --disable-triggers brackets the COPY statements with
-    # ALTER TABLE ... DISABLE/ENABLE TRIGGER ALL, so FK/trigger ordering
-    # between tables can't block the load. Requires superuser, which we are.
-    dump_flags+=(--data-only --disable-triggers)
+    # --disable-triggers brackets each table's data with
+    # ALTER TABLE ... DISABLE/ENABLE TRIGGER ALL, so FK-enforcement triggers
+    # can't block load order (needed for e.g. chat_chatmessage's circular FK).
+    # --inserts --on-conflict-do-nothing: your own migrations already ran
+    # against V2 and some tables (Django's django_content_type,
+    # auth_permission, ...) get pre-seeded rows as a side effect. Row-by-row
+    # INSERT ... ON CONFLICT DO NOTHING skips exactly those collisions at the
+    # SQL level instead of aborting the whole table's load — real errors
+    # (missing column, wrong type, etc.) still stop the script.
+    dump_flags+=(--data-only --disable-triggers --inserts --on-conflict-do-nothing)
     info "streaming DATA ONLY for '$tenant': V1 -> V2 (schema must already exist there — e.g. from your migrations)"
     ;;
   "")
