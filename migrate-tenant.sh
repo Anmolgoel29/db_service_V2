@@ -93,15 +93,83 @@ if [[ $mode == "" ]]; then
   # The load above connected (and therefore created every object) as the
   # `postgres` superuser, since --no-owner strips the original OWNER TO
   # statements. Left alone, `postgres` would own goelneha's tables instead of
-  # goelneha's own role — reassign ownership and reapply dbctl.sh new's
-  # schema-level lockdown (CREATE on public revoked from PUBLIC) that
-  # dropping/recreating the schema just reset to Postgres's defaults.
+  # goelneha's own role — hand every object in `public` over and reapply
+  # dbctl.sh new's schema-level lockdown (CREATE on public revoked from PUBLIC)
+  # that dropping/recreating the schema just reset to Postgres's defaults.
+  #
+  # Deliberately NOT `REASSIGN OWNED BY postgres TO <tenant>`: `postgres` is the
+  # bootstrap superuser, so it also owns pinned catalog objects, and REASSIGN
+  # OWNED is all-or-nothing over everything a role owns. It always dies with
+  #   cannot reassign ownership of objects owned by role postgres
+  #   because they are required by the database system
+  # before it ever reaches the tenant's tables. Walking `public` and emitting
+  # one ALTER ... OWNER TO per object (psql's \gexec runs each row of the
+  # result as SQL) touches only what this migration actually created.
   info "reassigning ownership in '$tenant' from postgres to $tenant"
   compose_v2 exec -T -e PGPASSWORD="$POSTGRES_PASSWORD" postgres \
-    psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d "$tenant" <<SQL
-REASSIGN OWNED BY postgres TO "$tenant";
+    psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d "$tenant" \
+         -v owner="$tenant" <<'SQL'
+SELECT format('ALTER SCHEMA public OWNER TO %I', :'owner')
+WHERE (SELECT nspowner FROM pg_namespace WHERE nspname = 'public') <> :'owner'::regrole
+\gexec
+
+-- Tables, views, matviews, sequences, foreign tables. ALTER TABLE carries a
+-- table's indexes, TOAST table and owned (serial/identity) sequences with it,
+-- so the sequence rows below are usually already no-ops by the time they run.
+-- The pg_depend 'e' filter here and in the two queries after it skips objects
+-- that belong to an extension (pgcrypto, uuid-ossp, postgis' spatial_ref_sys):
+-- those are the farm's to own, not the tenant's.
+SELECT format('ALTER %s %I.%I OWNER TO %I',
+              CASE c.relkind WHEN 'r' THEN 'TABLE'
+                             WHEN 'p' THEN 'TABLE'
+                             WHEN 'f' THEN 'FOREIGN TABLE'
+                             WHEN 'v' THEN 'VIEW'
+                             WHEN 'm' THEN 'MATERIALIZED VIEW'
+                             WHEN 'S' THEN 'SEQUENCE' END,
+              n.nspname, c.relname, :'owner')
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'S')
+  AND c.relowner <> :'owner'::regrole
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass
+                    AND d.objid = c.oid AND d.deptype = 'e')
+ORDER BY (c.relkind = 'S'), c.relname
+\gexec
+
+-- Functions, procedures and aggregates.
+SELECT format('ALTER ROUTINE %s OWNER TO %I', p.oid::regprocedure, :'owner')
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proowner <> :'owner'::regrole
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_proc'::regclass
+                    AND d.objid = p.oid AND d.deptype = 'e')
+\gexec
+
+-- Enums, domains, ranges and standalone composite types. Excluded: the array
+-- and table row types Postgres derives from the objects above, and multirange
+-- types, which Postgres refuses to alter directly (altering the range type
+-- they belong to moves them too).
+SELECT format('ALTER %s %s OWNER TO %I',
+              CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+              t.oid::regtype, :'owner')
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'public'
+  AND t.typowner <> :'owner'::regrole
+  AND t.typtype IN ('b', 'c', 'd', 'e', 'r')
+  AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind <> 'c')
+  AND NOT EXISTS (SELECT 1 FROM pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+  AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_type'::regclass
+                    AND d.objid = t.oid AND d.deptype = 'e')
+\gexec
+
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT ALL ON SCHEMA public TO "$tenant";
+GRANT ALL ON SCHEMA public TO :"owner";
 SQL
 fi
 
